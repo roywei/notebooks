@@ -3,11 +3,16 @@ import logging
 import os
 import sys
 
-import tensorflow as tf
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import AutoTokenizer, TFAutoModelForSequenceClassification
 from transformers.file_utils import is_sagemaker_dp_enabled
+from transformers import BertTokenizer, TFBertForMaskedLM
+from tensorflow import keras
+import tensorflow as tf
+from tensorflow.keras import layers
+from tensorflow.keras.layers.experimental.preprocessing import TextVectorization
+import numpy as np
+import re
 
 if os.environ.get("SDP_ENABLED") or is_sagemaker_dp_enabled():
     SDP_ENABLED = True
@@ -21,8 +26,9 @@ def fit(model, loss, opt, train_dataset, epochs, train_batch_size, max_steps=Non
     pbar = tqdm(train_dataset)
     for i, batch in enumerate(pbar):
         with tf.GradientTape() as tape:
-            inputs, targets = batch
-            outputs = model(batch)
+            inputs = batch[0]
+            targets = batch[1]
+            outputs = model(inputs, targets)
             loss_value = loss(targets, outputs.logits)
 
         if SDP_ENABLED:
@@ -37,7 +43,6 @@ def fit(model, loss, opt, train_dataset, epochs, train_batch_size, max_steps=Non
             if i == 0:
                 sdp.broadcast_variables(model.variables, root_rank=0)
                 sdp.broadcast_variables(opt.variables(), root_rank=0)
-                first_batch = False
 
         if max_steps and i >= max_steps:
             break
@@ -46,41 +51,106 @@ def fit(model, loss, opt, train_dataset, epochs, train_batch_size, max_steps=Non
     return train_results
 
 
+# Bert MLM example from https://keras.io/examples/nlp/masked_language_modeling/
+def custom_standardization(input_data):
+    lowercase = tf.strings.lower(input_data)
+    stripped_html = tf.strings.regex_replace(lowercase, "<br />", " ")
+    return tf.strings.regex_replace(
+        stripped_html, "[%s]" % re.escape("!#$%&'()*+,-./:;<=>?@\^_`{|}~"), ""
+    )
+
+
+def get_vectorize_layer(texts, vocab_size, max_seq, special_tokens=["[MASK]"]):
+    """Build Text vectorization layer
+
+    Args:
+      texts (list): List of string i.e input texts
+      vocab_size (int): vocab size
+      max_seq (int): Maximum sequence lenght.
+      special_tokens (list, optional): List of special tokens. Defaults to ['[MASK]'].
+
+    Returns:
+        layers.Layer: Return TextVectorization Keras Layer
+    """
+    vectorize_layer = TextVectorization(
+        max_tokens=vocab_size,
+        output_mode="int",
+        standardize=custom_standardization,
+        output_sequence_length=max_seq,
+    )
+    vectorize_layer.adapt(texts)
+
+    # Insert mask token in vocabulary
+    vocab = vectorize_layer.get_vocabulary()
+    vocab = vocab[2: vocab_size - len(special_tokens)] + ["[mask]"]
+    vectorize_layer.set_vocabulary(vocab)
+    return vectorize_layer
+
+
+
+def get_masked_input_and_labels(encoded_texts, mask_token_id):
+    # 15% BERT masking
+    inp_mask = np.random.rand(*encoded_texts.shape) < 0.15
+    # Do not mask special tokens
+    inp_mask[encoded_texts <= 2] = False
+    # Set targets to -1 by default, it means ignore
+    labels = -1 * np.ones(encoded_texts.shape, dtype=int)
+    # Set labels for masked tokens
+    labels[inp_mask] = encoded_texts[inp_mask]
+
+    # Prepare input
+    encoded_texts_masked = np.copy(encoded_texts)
+    # Set input to [MASK] which is the last token for the 90% of tokens
+    # This means leaving 10% unchanged
+    inp_mask_2mask = inp_mask & (np.random.rand(*encoded_texts.shape) < 0.90)
+    encoded_texts_masked[
+        inp_mask_2mask
+    ] = mask_token_id  # mask token is the last in the dict
+
+    # Set 10% to a random token
+    inp_mask_2random = inp_mask_2mask & (np.random.rand(*encoded_texts.shape) < 1 / 9)
+    encoded_texts_masked[inp_mask_2random] = np.random.randint(
+        3, mask_token_id, inp_mask_2random.sum()
+    )
+
+    # Prepare sample_weights to pass to .fit() method
+    sample_weights = np.ones(labels.shape)
+    sample_weights[labels == -1] = 0
+
+    # y_labels would be same as encoded_texts i.e input tokens
+    y_labels = np.copy(encoded_texts)
+
+    return encoded_texts_masked, y_labels, sample_weights
+
+
+
 def get_datasets():
-    # Load dataset
     train_dataset, test_dataset = load_dataset("imdb", split=["train", "test"])
 
-    # Preprocess train dataset
-    train_dataset = train_dataset.map(
-        lambda e: tokenizer(e["text"], truncation=True, padding="max_length"), batched=True
+    vectorize_layer = get_vectorize_layer(
+        train_dataset['text'],
+        28996,
+        512,
+        special_tokens=["[MASK]"],
     )
-    train_dataset.set_format(type="tensorflow", columns=["input_ids", "attention_mask", "label"])
 
-    train_features = {
-        x: train_dataset[x].to_tensor(default_value=0, shape=[None, tokenizer.model_max_length])
-        for x in ["input_ids", "attention_mask"]
-    }
-    tf_train_dataset = tf.data.Dataset.from_tensor_slices((train_features, train_dataset["label"]))
+    # Get mask token id for masked language model
+    mask_token_id = vectorize_layer(["[MASK]"]).numpy()[0][0]
 
-    # Preprocess test dataset
-    test_dataset = test_dataset.map(
-        lambda e: tokenizer(e["text"], truncation=True, padding="max_length"), batched=True
+    # Prepare data for masked language model
+    x_all_review = vectorize_layer(train_dataset["text"]).numpy()
+    x_masked_train, y_masked_labels, sample_weights = get_masked_input_and_labels(
+        x_all_review, mask_token_id
     )
-    test_dataset.set_format(type="tensorflow", columns=["input_ids", "attention_mask", "label"])
-
-    test_features = {
-        x: test_dataset[x].to_tensor(default_value=0, shape=[None, tokenizer.model_max_length])
-        for x in ["input_ids", "attention_mask"]
-    }
-    tf_test_dataset = tf.data.Dataset.from_tensor_slices((test_features, test_dataset["label"]))
+    mlm_ds = tf.data.Dataset.from_tensor_slices(
+        (x_masked_train, y_masked_labels, sample_weights)
+    )
+    mlm_ds = mlm_ds.shuffle(1000).batch(args.train_batch_size)
 
     if SDP_ENABLED:
-        tf_train_dataset = tf_train_dataset.shard(sdp.size(), sdp.rank())
-        tf_test_dataset = tf_test_dataset.shard(sdp.size(), sdp.rank())
-    tf_train_dataset = tf_train_dataset.batch(args.train_batch_size, drop_remainder=True)
-    tf_test_dataset = tf_test_dataset.batch(args.eval_batch_size, drop_remainder=True)
+        tf_train_dataset = mlm_ds.shard(sdp.size(), sdp.rank())
 
-    return tf_train_dataset, tf_test_dataset
+    return tf_train_dataset
 
 
 if __name__ == "__main__":
@@ -122,17 +192,18 @@ if __name__ == "__main__":
             tf.config.experimental.set_visible_devices(gpus[sdp.local_rank()], "GPU")
 
     # Load model and tokenizer
-    model = TFAutoModelForSequenceClassification.from_pretrained(args.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
+    model = TFBertForMaskedLM.from_pretrained('bert-base-cased')
 
     # get datasets
-    tf_train_dataset, tf_test_dataset = get_datasets()
+    tf_train_dataset = get_datasets()
 
     # fine optimizer and loss
     optimizer = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
-    loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-    metrics = [tf.keras.metrics.SparseCategoricalAccuracy()]
-    model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
+    loss = keras.losses.SparseCategoricalCrossentropy(
+        reduction=tf.keras.losses.Reduction.NONE, from_logits=True
+    )
+    model.compile(optimizer=optimizer, loss=loss)
 
     # Training
     if args.do_train:
@@ -153,26 +224,3 @@ if __name__ == "__main__":
                     logger.info("  %s = %s", key, value)
                     writer.write("%s = %s\n" % (key, value))
 
-    # Evaluation
-    if args.do_eval and (not SDP_ENABLED or sdp.rank() == 0):
-
-        result = model.evaluate(tf_test_dataset, batch_size=args.eval_batch_size, return_dict=True)
-        logger.info("*** Evaluate ***")
-
-        output_eval_file = os.path.join(args.output_data_dir, "eval_results.txt")
-
-        with open(output_eval_file, "w") as writer:
-            logger.info("***** Eval results *****")
-            logger.info(result)
-            for key, value in result.items():
-                logger.info("  %s = %s", key, value)
-                writer.write("%s = %s\n" % (key, value))
-
-    # Save result
-    if SDP_ENABLED:
-        if sdp.rank() == 0:
-            model.save_pretrained(args.model_dir)
-            tokenizer.save_pretrained(args.model_dir)
-    else:
-        model.save_pretrained(args.model_dir)
-        tokenizer.save_pretrained(args.model_dir)
