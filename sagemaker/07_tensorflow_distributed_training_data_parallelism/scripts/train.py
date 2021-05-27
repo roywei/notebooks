@@ -37,7 +37,7 @@ def fit(model, loss, opt, train_dataset, epochs, train_batch_size, max_steps=Non
         grads = tape.gradient(loss_value, model.trainable_variables)
         opt.apply_gradients(zip(grads, model.trainable_variables))
 
-        pbar.set_description(f"Loss: {loss_value:.4f}")
+        pbar.set_description(f"Loss: {loss_value.numpy().sum():.4f}")
 
         if SDP_ENABLED:
             if i == 0:
